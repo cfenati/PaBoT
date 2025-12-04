@@ -139,7 +139,7 @@ def compute_split_indices(
         raise ValueError("Require train_frac > 0, val_frac >= 0, and train_frac + val_frac < 1.")
     n_train = int(n * train_frac)
     n_val = int(n * val_frac)
-    # ensure at least 1 sample per split if possible
+    # try to ensure at least 1 sample per split when possible
     if n_train == 0 and n > 0:
         n_train = 1
     if n_val == 0 and n > n_train + 1:
@@ -147,33 +147,51 @@ def compute_split_indices(
     return n_train, n_val
 
 
-def copy_pair(
-    pt: str,
-    sl: str,
-    mri_path: Path,
-    ct_path: Path,
+def split_paths(
+    paths: List[Path],
+    train_frac: float,
+    val_frac: float,
+    seed: int,
+) -> Tuple[List[Path], List[Path], List[Path]]:
+    """Randomly split a list of paths into train/val/test (UNPAIRED)."""
+    paths = list(paths)
+    rng = random.Random(seed)
+    rng.shuffle(paths)
+
+    n = len(paths)
+    n_train, n_val = compute_split_indices(n, train_frac, val_frac)
+    n_test = n - n_train - n_val
+
+    train = paths[:n_train]
+    val = paths[n_train:n_train + n_val]
+    test = paths[n_train + n_val:]
+
+    return train, val, test
+
+
+def copy_group(
+    paths: Iterable[Path],
+    phase: str,  # "train" / "val" / "test"
+    is_mri: bool,
     compact_mapping: Dict[str, str],
-    phase: str,
     output_root: Path,
     dry_run: bool,
 ) -> None:
-    compact_id = compact_mapping[pt]
-    dst_name = f"{compact_id}_slice_{sl}{mri_path.suffix.lower()}"  # assume CT shares suffix
+    """Copy ONE modality (MRI or CT) into phaseA or phaseB."""
+    phase_dir = output_root / f"{phase}{'A' if is_mri else 'B'}"
+    phase_dir.mkdir(parents=True, exist_ok=True)
 
-    phaseA_dir = output_root / f"{phase}A"
-    phaseB_dir = output_root / f"{phase}B"
-    phaseA_dir.mkdir(parents=True, exist_ok=True)
-    phaseB_dir.mkdir(parents=True, exist_ok=True)
+    for src in paths:
+        patient_token = infer_patient_token(src)
+        compact_id = compact_mapping[patient_token]
+        slice_id = infer_slice_number(src)
+        dst_name = f"{compact_id}_slice_{slice_id}{src.suffix.lower()}"
+        dst = phase_dir / dst_name
 
-    dst_mri = phaseA_dir / dst_name
-    dst_ct = phaseB_dir / dst_name
-
-    if dry_run:
-        print(f"[{phase}] Would copy MRI {mri_path} -> {dst_mri}")
-        print(f"[{phase}] Would copy CT  {ct_path} -> {dst_ct}")
-    else:
-        shutil.copy2(mri_path, dst_mri)
-        shutil.copy2(ct_path, dst_ct)
+        if dry_run:
+            print(f"[{phase}][{'MRI' if is_mri else 'CT '}] Would copy {src} -> {dst}")
+        else:
+            shutil.copy2(src, dst)
 
 
 def main() -> None:
@@ -189,51 +207,34 @@ def main() -> None:
 
     print(f"Found {len(mri_paths)} MRI files and {len(ct_paths)} CT files.")
 
-    # 1) Pair MRI/CT by patient + slice
-    pairs = pair_mri_ct_slices(mri_paths, ct_paths)
-    print(f"Using {len(pairs)} paired MRI/CT slices.")
-
-    # 2) Build patient compact IDs from all paths (MRI+CT)
+    # Build patient compact IDs from all files (MRI + CT)
     combined_paths = mri_paths + ct_paths
     compact_mapping = build_compact_ids(combined_paths, args.prefix)
-    print(f"Found {len(compact_mapping)} patients.")
+    print(f"Found {len(compact_mapping)} unique patients.")
 
-    # 3) Shuffle pairs
-    random.seed(args.seed)
-    random.shuffle(pairs)
+    # Randomly split MRI and CT slices independently (UNPAIRED)
+    mri_train, mri_val, mri_test = split_paths(
+        mri_paths, args.train_frac, args.val_frac, seed=args.seed
+    )
+    ct_train, ct_val, ct_test = split_paths(
+        ct_paths, args.train_frac, args.val_frac, seed=args.seed + 1  # different seed just to be safe
+    )
 
-    # 4) Compute split sizes
-    n = len(pairs)
-    n_train, n_val = compute_split_indices(n, args.train_frac, args.val_frac)
-    n_test = n - n_train - n_val
+    print("MRI split:  train =", len(mri_train), "val =", len(mri_val), "test =", len(mri_test))
+    print("CT split:   train =", len(ct_train), "val =", len(ct_val), "test =", len(ct_test))
 
-    print(f"Total slices: {n}")
-    print(f"Train: {n_train}, Val: {n_val}, Test: {n_test}")
-
-    # 5) Split
-    train_pairs = pairs[:n_train]
-    val_pairs = pairs[n_train:n_train + n_val]
-    test_pairs = pairs[n_train + n_val:]
-
-    # 6) Copy to destination
-    for phase, phase_pairs in [
-        ("train", train_pairs),
-        ("val", val_pairs),
-        ("test", test_pairs),
+    # Copy MRI slices to *A folders, CT slices to *B folders
+    for phase, mri_group, ct_group in [
+        ("train", mri_train, ct_train),
+        ("val",   mri_val,  ct_val),
+        ("test",  mri_test, ct_test),
     ]:
-        for pt, sl, mri_path, ct_path in phase_pairs:
-            copy_pair(
-                pt=pt,
-                sl=sl,
-                mri_path=mri_path,
-                ct_path=ct_path,
-                compact_mapping=compact_mapping,
-                phase=phase,
-                output_root=args.output,
-                dry_run=args.dry_run,
-            )
+        copy_group(mri_group, phase=phase, is_mri=True,  compact_mapping=compact_mapping,
+                   output_root=args.output, dry_run=args.dry_run)
+        copy_group(ct_group,  phase=phase, is_mri=False, compact_mapping=compact_mapping,
+                   output_root=args.output, dry_run=args.dry_run)
 
-    # 7) Save mapping
+    # Save mapping
     mapping_path = args.output / "patient_mapping.json"
     if args.dry_run:
         print(f"Would write patient mapping to {mapping_path}")
